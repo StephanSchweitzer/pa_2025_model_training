@@ -1,0 +1,10 @@
+.spyproject/
+__pycache__/
+cache_for_later/
+models/
+logs/
+new_approach/
+monitoring/
+src/
+voices/
+xtts_downloader.py

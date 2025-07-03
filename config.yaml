@@ -1,0 +1,42 @@
+data:
+  metadata_path: "../data/processed_datasets/metadata/all_voice_metadata.json"
+  sample_rate: 22050
+  samples_per_emotion: null  # Use all available data
+  
+model:
+  emotion_embedding_dim: 256
+  unfreeze_last_n_layers: 0  # Start with frozen XTTS, only train adapter
+  
+training:
+  num_epochs: 10
+  learning_rate: 5e-5
+  batch_size: 1  # XTTS works best with batch_size=1
+  gradient_accumulation_steps: 8  # Effective batch size = 8
+  
+  # Checkpointing
+  checkpoint_every: 500
+  save_best_only: true
+  
+  # Learning rate schedule
+  warmup_steps: 100
+  
+optimization:
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  
+paths:
+  checkpoint_dir: "checkpoints/emotion_xtts"
+  log_dir: "logs/emotion_xtts"
+
+# Training monitoring (wandb not required)
+logging:
+  save_frequency: 100  # Save logs every N steps
+  use_wandb: false  # Set to true only if wandb is installed
+  
+# Hardware settings
+device: "cuda"
+mixed_precision: true
+num_workers: 4
+
+# Reproducibility
+seed: 42

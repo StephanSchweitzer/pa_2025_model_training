@@ -1,0 +1,16 @@
+#WE NEED TO MAKE SURE WE HAVE C++ INSTALLED FOR DEPLOYMENT
+
+numpy
+pandas
+torch==2.5.1
+torchvision==0.20.1
+torchaudio
+librosa
+soundfile 
+scipy
+TTS
+torch
+transformers==4.36.2
+openai-whisper
+funasr 
+modelscope
