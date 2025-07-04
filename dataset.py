@@ -8,15 +8,11 @@ from typing import Dict, List, Optional
 import os
 from pathlib import Path
 
-class EmotionDataset(Dataset):
+
+class ValenceArousalDataset(Dataset):
     def __init__(self, config: Dict):
         self.config = config
-        self.valid_emotions = config['data']['emotions']  # Keep as list to preserve order
-        self.emotion_to_id = {emotion: idx for idx, emotion in enumerate(self.valid_emotions)}
         self.sample_rate = config['data']['sample_rate']
-        self.samples_per_emotion = config['data'].get('samples_per_emotion', None)
-        
-        # Get data directory from config, with fallback
         self.data_dir = Path(config['data'].get('data_dir', '../data'))
         
         metadata_path = config['data']['metadata_path']
@@ -26,52 +22,37 @@ class EmotionDataset(Dataset):
         
         self.metadata = []
         skipped = 0
-        emotion_counts = {}
-        limited_counts = {}
-        iemocap_skipped = 0
         
         for item in all_metadata:
             # Skip IEMOCAP for now since speaker info isn't available
             if item.get('dataset') == 'iemocap':
-                iemocap_skipped += 1
+                continue
+            
+            # Check for valence and arousal values
+            if 'valence' not in item or 'arousal' not in item:
+                skipped += 1
                 continue
                 
-            emotion_label = item.get('emotion_label', 'unknown')
-            
-            if emotion_label not in self.valid_emotions:
+            # Validate valence and arousal range [-1, 1]
+            try:
+                valence = float(item['valence'])
+                arousal = float(item['arousal'])
+                if not (-1 <= valence <= 1) or not (-1 <= arousal <= 1):
+                    skipped += 1
+                    continue
+            except (ValueError, TypeError):
                 skipped += 1
                 continue
             
             # Check if audio file exists
             audio_path = self.data_dir / item['processed_audio_path']
             if not audio_path.exists():
-                print(f"Warning: Audio file not found: {audio_path}")
                 skipped += 1
                 continue
             
-            if self.samples_per_emotion is not None:
-                current_count = emotion_counts.get(emotion_label, 0)
-                if current_count >= self.samples_per_emotion:
-                    limited_counts[emotion_label] = limited_counts.get(emotion_label, 0) + 1
-                    continue
-            
             self.metadata.append(item)
-            emotion_counts[emotion_label] = emotion_counts.get(emotion_label, 0) + 1
         
-        print(f"Loaded {len(self.metadata)} samples, skipped {skipped} invalid emotions")
-        print(f"Skipped {iemocap_skipped} IEMOCAP samples (no speaker info)")
-        
-        if self.samples_per_emotion is not None:
-            print(f"Limited to {self.samples_per_emotion} samples per emotion")
-            if limited_counts:
-                total_limited = sum(limited_counts.values())
-                print(f"Skipped {total_limited} additional samples due to per-emotion limits:")
-                for emotion, count in limited_counts.items():
-                    print(f"  {emotion}: {count} skipped")
-        
-        print("Final emotion distribution:")
-        for emotion, count in emotion_counts.items():
-            print(f"  {emotion}: {count}")
+        print(f"Loaded {len(self.metadata)} samples, skipped {skipped} invalid samples")
             
         # Parse speaker IDs and create speaker groupings
         self._parse_speaker_ids()
@@ -83,7 +64,6 @@ class EmotionDataset(Dataset):
         
         if dataset == 'ravdess':
             # ravdess_ravdess_audio_speech_actors_01-24_Actor_05_03-01-05-01-01-01-05_3612.wav
-            # Speaker ID is after "Actor_"
             parts = basename.split('_')
             for i, part in enumerate(parts):
                 if part == 'Actor' and i + 1 < len(parts):
@@ -91,14 +71,12 @@ class EmotionDataset(Dataset):
             
         elif dataset == 'emovdb':
             # emovdb_full_anger_449-476_0469_7254.wav
-            # Speaker ID is the range field (449-476)
             parts = basename.split('_')
             if len(parts) >= 4:
                 return f"emovdb_{parts[3]}"
                 
         elif dataset == 'cremad':
             # cremad_cremad_1038_IEO_DIS_HI_5551.wav
-            # Speaker ID is the first number after cremad_cremad_
             parts = basename.split('_')
             if len(parts) >= 3:
                 return f"cremad_{parts[2]}"
@@ -122,19 +100,6 @@ class EmotionDataset(Dataset):
             if speaker_id not in self.speaker_to_indices:
                 self.speaker_to_indices[speaker_id] = []
             self.speaker_to_indices[speaker_id].append(idx)
-        
-        print(f"\nSpeaker statistics:")
-        single_sample_speakers = 0
-        multi_sample_speakers = 0
-        for speaker_id, indices in self.speaker_to_indices.items():
-            if len(indices) == 1:
-                single_sample_speakers += 1
-            else:
-                multi_sample_speakers += 1
-        
-        print(f"  Speakers with multiple samples: {multi_sample_speakers}")
-        print(f"  Speakers with single sample: {single_sample_speakers}")
-        print(f"  Total unique speakers: {len(self.speaker_to_indices)}")
     
     def _get_speaker_reference(self, current_idx: int) -> str:
         """Get a different audio file from the same speaker as reference."""
@@ -148,7 +113,7 @@ class EmotionDataset(Dataset):
             ref_idx = random.choice(available_indices)
             return self.metadata[ref_idx]['processed_audio_path']
         else:
-            # If speaker has only one sample, use the same file (reconstruction)
+            # If speaker has only one sample, use the same file
             return current_item['processed_audio_path']
     
     def _load_audio_safe(self, audio_path: str, description: str = "audio") -> torch.Tensor:
@@ -165,7 +130,7 @@ class EmotionDataset(Dataset):
             if waveform.shape[0] > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Normalize audio to prevent clipping
+            # Normalize audio
             max_val = torch.max(torch.abs(waveform))
             if max_val > 0:
                 waveform = waveform / max_val
@@ -174,7 +139,6 @@ class EmotionDataset(Dataset):
             
         except Exception as e:
             print(f"Error loading {description} from {audio_path}: {e}")
-            # Return silence as fallback
             return torch.zeros(int(self.sample_rate * 1.0))  # 1 second of silence
     
     def __len__(self):
@@ -191,21 +155,23 @@ class EmotionDataset(Dataset):
         speaker_ref_path = self.data_dir / self._get_speaker_reference(idx)
         speaker_ref_waveform = self._load_audio_safe(str(speaker_ref_path), "speaker reference")
         
-        emotion_label = sample['emotion_label']
-        emotion_id = self.emotion_to_id[emotion_label]  # This ensures 0-6 range
+        # Get valence and arousal values
+        valence = float(sample['valence'])
+        arousal = float(sample['arousal'])
         
         return {
             'text': sample['text'],
             'audio': waveform,
             'speaker_ref': speaker_ref_waveform,
-            'emotion_id': torch.tensor(emotion_id, dtype=torch.long),  # Use mapped ID
-            'emotion_label': emotion_label,
+            'valence': torch.tensor(valence, dtype=torch.float32),
+            'arousal': torch.tensor(arousal, dtype=torch.float32),
             'speaker_id': sample['speaker_id'],
             'audio_path': str(audio_path)
         }
 
-def collate_fn(batch):
-    """Custom collate function for variable-length audio."""
+
+def valence_arousal_collate_fn(batch):
+    """Custom collate function for variable-length audio with valence-arousal."""
     texts = [item['text'] for item in batch]
     
     # Handle variable-length target audio
@@ -234,17 +200,19 @@ def collate_fn(batch):
     
     audios = torch.stack(padded_audios)
     speaker_refs = torch.stack(padded_speaker_refs)
-    emotion_ids = torch.stack([item['emotion_id'] for item in batch])
-    emotion_labels = [item['emotion_label'] for item in batch]
+    valences = torch.stack([item['valence'] for item in batch])
+    arousals = torch.stack([item['arousal'] for item in batch])
     speaker_ids = [item['speaker_id'] for item in batch]
+    audio_paths = [item['audio_path'] for item in batch]
     
     return {
         'texts': texts,
         'audios': audios,
         'speaker_refs': speaker_refs,
-        'emotion_ids': emotion_ids,
-        'emotion_labels': emotion_labels,
+        'valence': valences,
+        'arousal': arousals,
         'speaker_ids': speaker_ids,
+        'audio_paths': audio_paths,
         'audio_lengths': torch.tensor(audio_lengths),
         'speaker_ref_lengths': torch.tensor(speaker_ref_lengths)
     }

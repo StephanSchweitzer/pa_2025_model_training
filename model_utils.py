@@ -14,16 +14,6 @@ DEFAULT_XTTS_CONFIG = {
     "supported_languages": ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja"]
 }
 
-EMOTION_MAPPING = {
-    0: "neutral",
-    1: "happy", 
-    2: "sad",
-    3: "angry",
-    4: "surprised",
-    5: "fearful",
-    6: "disgusted"
-}
-
 
 def ensure_local_model_exists(local_model_dir="./models/xtts_v2", model_name="tts_models/multilingual/multi-dataset/xtts_v2"):
     local_model_dir = Path(local_model_dir)
