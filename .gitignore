@@ -11,3 +11,4 @@ xtts_downloader.py
 download_xtts.py
 test_dvae.py
 xtts_checkpoints/
+checkpoints/

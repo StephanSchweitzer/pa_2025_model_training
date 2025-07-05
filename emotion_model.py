@@ -15,6 +15,8 @@ from model_utils import (
     get_device_info,
     DEFAULT_XTTS_CONFIG
 )
+from TTS.tts.layers.xtts.dvae import DiscreteVAE
+from TTS.tts.layers.tortoise.arch_utils import TorchMelSpectrogram
 
 
 class ValenceArousalAdapter(nn.Module):   
@@ -122,10 +124,11 @@ class ValenceArousalXTTS(nn.Module):
             print(f"Local model not found: {e}")
             print("Falling back to TTS API...")
             
-            # Fallback to TTS API (works with firewalls)
+            # Fallback to TTS API (works with firewalls/proxies)
             try:
                 from TTS.api import TTS
-                tts_api = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+                # Disable progress bar to avoid download issues with proxy
+                tts_api = TTS("tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False)
                 self.xtts = tts_api.synthesizer.tts_model
                 self.config = self.xtts.config
                 print("Loaded XTTS via TTS API")
@@ -142,6 +145,11 @@ class ValenceArousalXTTS(nn.Module):
         
         freeze_model_parameters(self.xtts, freeze=True)
         
+        # Initialize separate DVAE and mel converter for tokenization (like working test_dvae.py)
+        self.dvae = None
+        self.mel_converter = None
+        self._init_dvae_and_mel_converter()
+        
         print("ValenceArousalXTTS initialization complete!")
     
     def to(self, device):
@@ -152,6 +160,12 @@ class ValenceArousalXTTS(nn.Module):
         
         if hasattr(self, 'va_adapter'):
             self.va_adapter = self.va_adapter.to(device)
+        
+        if hasattr(self, 'dvae') and self.dvae is not None:
+            self.dvae = self.dvae.to(device)
+        
+        if hasattr(self, 'mel_converter') and self.mel_converter is not None:
+            self.mel_converter = self.mel_converter.to(device)
             
         return self
     
@@ -165,9 +179,109 @@ class ValenceArousalXTTS(nn.Module):
         
         if hasattr(self, 'va_adapter'):
             self.va_adapter = self.va_adapter.cuda(device)
+        
+        if hasattr(self, 'dvae') and self.dvae is not None:
+            self.dvae = self.dvae.cuda(device)
+        
+        if hasattr(self, 'mel_converter') and self.mel_converter is not None:
+            self.mel_converter = self.mel_converter.cuda(device)
             
         return self
     
+    def _init_dvae_and_mel_converter(self):
+        """Initialize DVAE and mel converter - following working test_dvae.py pattern."""
+        try:
+            # Get file paths
+            dvae_path = os.path.join(self.local_model_dir, "dvae.pth")
+            mel_stats_path = os.path.join(self.local_model_dir, "mel_stats.pth")
+            
+            if not os.path.exists(dvae_path):
+                print(f"Error: dvae.pth not found at {dvae_path}")
+                return
+                
+            if not os.path.exists(mel_stats_path):
+                print(f"Error: mel_stats.pth not found at {mel_stats_path}")
+                return
+            
+            # Initialize DVAE exactly like working test_dvae.py
+            self.dvae = DiscreteVAE(
+                channels=80, normalization=None, positional_dims=1, num_tokens=1024,
+                codebook_dim=512, hidden_dim=512, num_resnet_blocks=3, kernel_size=3,
+                num_layers=2, use_transposed_convs=False,
+            )
+            
+            # Load DVAE weights
+            self.dvae.load_state_dict(torch.load(dvae_path, map_location='cpu'), strict=False)
+            self.dvae.eval()  # Set to eval mode
+            
+            # Initialize mel converter
+            self.mel_converter = TorchMelSpectrogram(
+                mel_norm_file=mel_stats_path, 
+                sampling_rate=22050
+            )
+            
+            print("✅ DVAE and mel converter initialized successfully")
+            
+        except Exception as e:
+            print(f"❌ Error initializing DVAE and mel converter: {e}")
+            self.dvae = None
+            self.mel_converter = None
+
+    def extract_dvae_tokens(self, audio_tensor):
+        """Extract discrete tokens from audio using separate DVAE - following working test_dvae.py."""
+        try:
+            if self.dvae is None or self.mel_converter is None:
+                raise RuntimeError("DVAE or mel converter not initialized. Check dvae.pth and mel_stats.pth paths.")
+                
+            device = next(self.parameters()).device
+            
+            # Ensure audio is properly shaped and on correct device
+            if audio_tensor.dim() == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)  # Add channel dim
+            audio_tensor = audio_tensor.to(device)
+            
+            # Convert to mel spectrogram using the same approach as test_dvae.py
+            mel = self.mel_converter(audio_tensor.unsqueeze(0))  # Add batch dim for mel converter
+            
+            # Handle remainder like in test_dvae.py
+            remainder = mel.shape[-1] % 4
+            if remainder:
+                mel = mel[:, :, :-remainder]
+            
+            # Extract discrete tokens using get_codebook_indices (the working method!)
+            with torch.no_grad():
+                tokens = self.dvae.get_codebook_indices(mel)
+                return tokens.squeeze(0)  # Remove batch dim
+                
+        except Exception as e:
+            print(f"Error extracting DVAE tokens: {e}")
+            return None
+
+    def extract_dvae_tokens_batch(self, audio_batch):
+        """Extract discrete tokens for a batch of audio tensors - FAIL if any extraction fails."""
+        try:
+            if self.dvae is None or self.mel_converter is None:
+                raise RuntimeError("DVAE or mel converter not initialized. Check dvae.pth and mel_stats.pth paths.")
+                
+            tokens_list = []
+            failed_samples = []
+            
+            for i, audio in enumerate(audio_batch):
+                tokens = self.extract_dvae_tokens(audio)
+                if tokens is not None:
+                    tokens_list.append(tokens)
+                else:
+                    failed_samples.append(i)
+                    
+            if failed_samples:
+                raise ValueError(f"Token extraction failed for samples: {failed_samples}. Cannot train with incomplete ground truth.")
+                    
+            return tokens_list
+            
+        except Exception as e:
+            print(f"CRITICAL: Batch token extraction failed: {e}")
+            raise e  # Don't fallback to dummy tokens!
+
     def _prepare_audio_tensor(self, audio_tensor):
         """Prepare audio tensor for XTTS conditioning."""
         if audio_tensor.dim() == 3:
@@ -179,6 +293,32 @@ class ValenceArousalXTTS(nn.Module):
             raise ValueError(f"Expected 1D audio tensor, got {audio_tensor.dim()}D")
         
         return audio_tensor.cpu()
+
+    def _create_temp_audio_file(self, audio_tensor):
+        """Create temporary audio file with better error handling."""
+        temp_file_obj = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_path = temp_file_obj.name
+        temp_file_obj.close()  # Close immediately to avoid permission issues
+        
+        try:
+            audio_to_save = audio_tensor.unsqueeze(0) if audio_tensor.dim() == 1 else audio_tensor
+            torchaudio.save(temp_path, audio_to_save, DEFAULT_XTTS_CONFIG["sample_rate"])
+            return temp_path
+        except Exception as e:
+            # Clean up if save failed
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            raise e
+
+    def _cleanup_temp_file(self, temp_path):
+        """Safely clean up temporary file."""
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception as e:
+            print(f"Warning: Could not delete temporary file {temp_path}: {e}")
             
     def get_conditioning_latents_with_valence_arousal(self, audio_input, valence, arousal, training=False):
         # Ensure valence and arousal are on correct device
@@ -194,45 +334,35 @@ class ValenceArousalXTTS(nn.Module):
             arousal = torch.tensor(arousal, dtype=torch.float32, device=device)
         
         # Handle different audio input types
-        if training and isinstance(audio_input, torch.Tensor):
-            audio_input = self._prepare_audio_tensor(audio_input)
+        temp_path = None
+        try:
+            if training and isinstance(audio_input, torch.Tensor):
+                audio_input = self._prepare_audio_tensor(audio_input)
+                temp_path = self._create_temp_audio_file(audio_input)
+                audio_path_for_xtts = [temp_path]
+                    
+            elif isinstance(audio_input, (str, list)):
+                audio_path_for_xtts = audio_input if isinstance(audio_input, list) else [audio_input]
+            else:
+                raise ValueError(f"Unsupported audio_input type: {type(audio_input)}")
             
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                temp_path = tmp_file.name
-                
-            try:
-                audio_to_save = audio_input.unsqueeze(0) if audio_input.dim() == 1 else audio_input
-                torchaudio.save(temp_path, audio_to_save, DEFAULT_XTTS_CONFIG["sample_rate"])
-                
-                if training:
-                    gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
-                        audio_path=[temp_path]
-                    )
-                else:
-                    with torch.no_grad():
-                        gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
-                            audio_path=[temp_path]
-                        )
-            finally:
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-                        
-        elif isinstance(audio_input, (str, list)):
+            # Get conditioning latents from XTTS
             if training:
                 gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
-                    audio_path=audio_input if isinstance(audio_input, list) else [audio_input]
+                    audio_path=audio_path_for_xtts
                 )
             else:
                 with torch.no_grad():
                     gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
-                        audio_path=audio_input if isinstance(audio_input, list) else [audio_input]
+                        audio_path=audio_path_for_xtts
                     )
-        else:
-            raise ValueError(f"Unsupported audio_input type: {type(audio_input)}")
+            
+        finally:
+            # Always clean up temp file
+            if temp_path is not None:
+                self._cleanup_temp_file(temp_path)
         
-        # Move to device
+        # Move to device and ensure proper shapes
         gpt_cond_latent = gpt_cond_latent.to(device)
         speaker_embedding = speaker_embedding.to(device)
         
@@ -242,8 +372,6 @@ class ValenceArousalXTTS(nn.Module):
         )
         
         return emotion_gpt_latent, emotion_speaker_embedding
-    
-
 
     def inference_with_valence_arousal(self, text, language, audio_path, valence, arousal, **kwargs):
         if language not in DEFAULT_XTTS_CONFIG["supported_languages"]:
@@ -251,23 +379,27 @@ class ValenceArousalXTTS(nn.Module):
         
         print(f"Generating speech with valence: {valence}, arousal: {arousal}")
         
-        gpt_cond_latent, speaker_embedding = self.get_conditioning_latents_with_valence_arousal(
-            audio_path, valence, arousal, training=False
-        )
-        
-        # Ensure correct dimensions
-        if gpt_cond_latent.dim() > 2:
-            gpt_cond_latent = gpt_cond_latent.squeeze(0)
-        if speaker_embedding.dim() > 1:
-            speaker_embedding = speaker_embedding.squeeze(0)
-        
-        return self.xtts.inference(
-            text,
-            language,
-            gpt_cond_latent,
-            speaker_embedding,
-            **kwargs
-        )
+        try:
+            gpt_cond_latent, speaker_embedding = self.get_conditioning_latents_with_valence_arousal(
+                audio_path, valence, arousal, training=False
+            )
+            
+            # Ensure correct dimensions for inference
+            if gpt_cond_latent.dim() > 2:
+                gpt_cond_latent = gpt_cond_latent.squeeze(0)
+            if speaker_embedding.dim() > 1:
+                speaker_embedding = speaker_embedding.squeeze(0)
+            
+            return self.xtts.inference(
+                text,
+                language,
+                gpt_cond_latent,
+                speaker_embedding,
+                **kwargs
+            )
+        except Exception as e:
+            print(f"Error during inference: {e}")
+            raise e
     
     def unfreeze_valence_arousal_adapter(self):
         freeze_model_parameters(self.va_adapter, freeze=False)

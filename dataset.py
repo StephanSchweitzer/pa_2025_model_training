@@ -151,9 +151,9 @@ class ValenceArousalDataset(Dataset):
         audio_path = self.data_dir / sample['processed_audio_path']
         waveform = self._load_audio_safe(str(audio_path), "target audio")
         
-        # Load speaker reference audio
-        speaker_ref_path = self.data_dir / self._get_speaker_reference(idx)
-        speaker_ref_waveform = self._load_audio_safe(str(speaker_ref_path), "speaker reference")
+        # Get speaker reference file path (DON'T load the audio - just return the path!)
+        speaker_ref_relative_path = self._get_speaker_reference(idx)
+        speaker_ref_path = str((self.data_dir / speaker_ref_relative_path).resolve())  # Convert to absolute path
         
         # Get valence and arousal values
         valence = float(sample['valence'])
@@ -162,7 +162,7 @@ class ValenceArousalDataset(Dataset):
         return {
             'text': sample['text'],
             'audio': waveform,
-            'speaker_ref': speaker_ref_waveform,
+            'speaker_ref': speaker_ref_path,  # ← File path string instead of tensor!
             'valence': torch.tensor(valence, dtype=torch.float32),
             'arousal': torch.tensor(arousal, dtype=torch.float32),
             'speaker_id': sample['speaker_id'],
@@ -186,20 +186,10 @@ def valence_arousal_collate_fn(batch):
             audio = torch.nn.functional.pad(audio, (0, padding))
         padded_audios.append(audio)
     
-    # Handle variable-length speaker reference audio
-    speaker_ref_lengths = [item['speaker_ref'].shape[0] for item in batch]
-    max_speaker_ref_length = max(speaker_ref_lengths)
-    
-    padded_speaker_refs = []
-    for item in batch:
-        speaker_ref = item['speaker_ref']
-        if speaker_ref.shape[0] < max_speaker_ref_length:
-            padding = max_speaker_ref_length - speaker_ref.shape[0]
-            speaker_ref = torch.nn.functional.pad(speaker_ref, (0, padding))
-        padded_speaker_refs.append(speaker_ref)
+    # Speaker refs are now just file paths - no tensor loading or padding needed!
+    speaker_refs = [item['speaker_ref'] for item in batch]
     
     audios = torch.stack(padded_audios)
-    speaker_refs = torch.stack(padded_speaker_refs)
     valences = torch.stack([item['valence'] for item in batch])
     arousals = torch.stack([item['arousal'] for item in batch])
     speaker_ids = [item['speaker_id'] for item in batch]
@@ -208,11 +198,11 @@ def valence_arousal_collate_fn(batch):
     return {
         'texts': texts,
         'audios': audios,
-        'speaker_refs': speaker_refs,
+        'speaker_refs': speaker_refs,  # ← List of file path strings (no tensors!)
         'valence': valences,
         'arousal': arousals,
         'speaker_ids': speaker_ids,
         'audio_paths': audio_paths,
         'audio_lengths': torch.tensor(audio_lengths),
-        'speaker_ref_lengths': torch.tensor(speaker_ref_lengths)
+        'languages': ['en'] * len(batch)  # Add default language for compatibility
     }
