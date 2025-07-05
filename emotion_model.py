@@ -47,23 +47,45 @@ class ValenceArousalAdapter(nn.Module):
         self.emotion_gate = nn.Parameter(torch.tensor(0.3))
         
     def forward(self, gpt_cond_latent, speaker_embedding, valence, arousal):
+        # Get device from input tensors
+        device = gpt_cond_latent.device
+        
         if gpt_cond_latent.dim() == 2:
             gpt_cond_latent = gpt_cond_latent.unsqueeze(0)
         
+        # CRITICAL FIX: Preserve original speaker embedding shape for XTTS compatibility
+        original_speaker_shape = speaker_embedding.shape
+        needs_3d_output = (original_speaker_shape[-1] == 1)  # Check if it's [batch, 512, 1] format
+        
+        # Normalize speaker embedding to 2D for internal processing only
         if speaker_embedding.dim() == 3:
             if speaker_embedding.shape[-1] == 1:
+                # [batch, 512, 1] → [batch, 512] (temporarily for linear layers)
                 speaker_embedding = speaker_embedding.squeeze(-1)
+            elif speaker_embedding.shape[1] == 1:
+                # [batch, 1, 512] → [batch, 512] 
+                speaker_embedding = speaker_embedding.squeeze(1)
             else:
+                # [1, batch, 512] → [batch, 512]
                 if speaker_embedding.shape[0] == 1:
                     speaker_embedding = speaker_embedding.squeeze(0)
         elif speaker_embedding.dim() == 1:
+            # [512] → [1, 512]
             speaker_embedding = speaker_embedding.unsqueeze(0)
         
-        # Ensure valence and arousal are tensors
+        # Ensure ALL tensors are on the same device
         if not isinstance(valence, torch.Tensor):
-            valence = torch.tensor(valence, dtype=torch.float32, device=gpt_cond_latent.device)
+            valence = torch.tensor(valence, dtype=torch.float32, device=device)
+        else:
+            valence = valence.to(device)
+            
         if not isinstance(arousal, torch.Tensor):
-            arousal = torch.tensor(arousal, dtype=torch.float32, device=gpt_cond_latent.device)
+            arousal = torch.tensor(arousal, dtype=torch.float32, device=device)
+        else:
+            arousal = arousal.to(device)
+        
+        # Ensure speaker embedding is on correct device
+        speaker_embedding = speaker_embedding.to(device)
         
         if valence.dim() == 0:
             valence = valence.unsqueeze(0)
@@ -85,6 +107,10 @@ class ValenceArousalAdapter(nn.Module):
             if speaker_embedding.shape[0] == 1:
                 speaker_embedding = speaker_embedding.expand(batch_size, -1)
         
+        # Ensure speaker embedding is 2D for linear layers: [batch, 512]
+        assert speaker_embedding.dim() == 2, f"Speaker embedding should be 2D for adapter, got {speaker_embedding.dim()}D: {speaker_embedding.shape}"
+        assert speaker_embedding.shape[1] == 512, f"Speaker embedding should have 512 features, got {speaker_embedding.shape[1]}"
+        
         # Transform GPT latents
         T = gpt_cond_latent.shape[1]
         emotion_emb_expanded = emotion_emb.unsqueeze(1).expand(-1, T, -1)
@@ -94,11 +120,15 @@ class ValenceArousalAdapter(nn.Module):
         
         emotion_gpt_latent = gpt_cond_latent + self.emotion_gate * gpt_transform
         
-        # Transform speaker embedding
+        # Transform speaker embedding (working with 2D: [batch, 512])
         speaker_input = torch.cat([speaker_embedding, emotion_emb], dim=-1)
         speaker_transform = self.speaker_embed_transform(speaker_input)
         
         emotion_speaker_embedding = speaker_embedding + self.emotion_gate * speaker_transform
+        
+        # CRITICAL FIX: Restore original 3D format if needed for XTTS compatibility
+        if needs_3d_output:
+            emotion_speaker_embedding = emotion_speaker_embedding.unsqueeze(-1)  # [batch, 512] → [batch, 512, 1]
         
         return emotion_gpt_latent, emotion_speaker_embedding
 
@@ -187,6 +217,17 @@ class ValenceArousalXTTS(nn.Module):
             self.mel_converter = self.mel_converter.cuda(device)
             
         return self
+    
+    def debug_tensor_devices(self, *tensors, names=None):
+        """Debug helper to check tensor devices"""
+        if names is None:
+            names = [f"tensor_{i}" for i in range(len(tensors))]
+        
+        for tensor, name in zip(tensors, names):
+            if torch.is_tensor(tensor):
+                print(f"{name}: device={tensor.device}, shape={tensor.shape}")
+            else:
+                print(f"{name}: not a tensor, type={type(tensor)}")
     
     def _init_dvae_and_mel_converter(self):
         """Initialize DVAE and mel converter - following working test_dvae.py pattern."""
@@ -321,17 +362,8 @@ class ValenceArousalXTTS(nn.Module):
             print(f"Warning: Could not delete temporary file {temp_path}: {e}")
             
     def get_conditioning_latents_with_valence_arousal(self, audio_input, valence, arousal, training=False):
-        # Ensure valence and arousal are on correct device
+        # Get device consistently
         device = next(self.parameters()).device
-        if isinstance(valence, torch.Tensor):
-            valence = valence.to(device)
-        else:
-            valence = torch.tensor(valence, dtype=torch.float32, device=device)
-            
-        if isinstance(arousal, torch.Tensor):
-            arousal = arousal.to(device)
-        else:
-            arousal = torch.tensor(arousal, dtype=torch.float32, device=device)
         
         # Handle different audio input types
         temp_path = None
@@ -348,12 +380,12 @@ class ValenceArousalXTTS(nn.Module):
             
             # Get conditioning latents from XTTS
             if training:
-                gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
+                original_gpt_cond_latent, original_speaker_embedding = self.xtts.get_conditioning_latents(
                     audio_path=audio_path_for_xtts
                 )
             else:
                 with torch.no_grad():
-                    gpt_cond_latent, speaker_embedding = self.xtts.get_conditioning_latents(
+                    original_gpt_cond_latent, original_speaker_embedding = self.xtts.get_conditioning_latents(
                         audio_path=audio_path_for_xtts
                     )
             
@@ -362,13 +394,24 @@ class ValenceArousalXTTS(nn.Module):
             if temp_path is not None:
                 self._cleanup_temp_file(temp_path)
         
-        # Move to device and ensure proper shapes
-        gpt_cond_latent = gpt_cond_latent.to(device)
-        speaker_embedding = speaker_embedding.to(device)
+        # CRITICAL FIX: Ensure tensors are on correct device IMMEDIATELY after getting them
+        original_gpt_cond_latent = original_gpt_cond_latent.to(device)
+        original_speaker_embedding = original_speaker_embedding.to(device)
         
-        # Apply valence-arousal transformation
+        # Ensure valence/arousal are also on correct device  
+        if not isinstance(valence, torch.Tensor):
+            valence = torch.tensor(valence, dtype=torch.float32, device=device)
+        else:
+            valence = valence.to(device)
+            
+        if not isinstance(arousal, torch.Tensor):
+            arousal = torch.tensor(arousal, dtype=torch.float32, device=device)
+        else:
+            arousal = arousal.to(device)
+        
+        # Apply valence-arousal transformation (now all tensors are on same device)
         emotion_gpt_latent, emotion_speaker_embedding = self.va_adapter(
-            gpt_cond_latent, speaker_embedding, valence, arousal
+            original_gpt_cond_latent, original_speaker_embedding, valence, arousal
         )
         
         return emotion_gpt_latent, emotion_speaker_embedding
@@ -384,11 +427,17 @@ class ValenceArousalXTTS(nn.Module):
                 audio_path, valence, arousal, training=False
             )
             
-            # Ensure correct dimensions for inference
-            if gpt_cond_latent.dim() > 2:
-                gpt_cond_latent = gpt_cond_latent.squeeze(0)
-            if speaker_embedding.dim() > 1:
-                speaker_embedding = speaker_embedding.squeeze(0)
+            # GPT latent should be 3D: [batch_size, sequence_length, features]
+            if gpt_cond_latent.dim() == 2:
+                gpt_cond_latent = gpt_cond_latent.unsqueeze(0)  # Add batch dimension: [1, seq_len, features]
+            elif gpt_cond_latent.dim() == 4:
+                gpt_cond_latent = gpt_cond_latent.squeeze(0)   # Remove extra batch dim if present
+            
+            print(f"GPT latent shape: {gpt_cond_latent.shape}")
+            print(f"Speaker embedding shape: {speaker_embedding.shape}")
+            
+            # Ensure correct expected shapes for XTTS
+            assert gpt_cond_latent.dim() == 3, f"GPT latent should be 3D, got {gpt_cond_latent.dim()}D: {gpt_cond_latent.shape}"
             
             return self.xtts.inference(
                 text,
@@ -399,6 +448,8 @@ class ValenceArousalXTTS(nn.Module):
             )
         except Exception as e:
             print(f"Error during inference: {e}")
+            print(f"GPT latent shape: {gpt_cond_latent.shape if 'gpt_cond_latent' in locals() else 'undefined'}")
+            print(f"Speaker embedding shape: {speaker_embedding.shape if 'speaker_embedding' in locals() else 'undefined'}")
             raise e
     
     def unfreeze_valence_arousal_adapter(self):
@@ -444,6 +495,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         model = model.cuda()
         print("Model moved to GPU")
+        print(f"Model device: {next(model.parameters()).device}")
+        print(f"Adapter device: {next(model.va_adapter.parameters()).device}")
     
     info = model.get_model_info()
     print("Model Info:")

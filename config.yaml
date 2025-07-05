@@ -11,7 +11,7 @@ training:
   learning_rate: 5e-5
   batch_size: 1  # XTTS works best with batch_size=1
   
-  # Loss weights
+  # Original loss weights (keeping for compatibility)
   valence_weight: 1.0
   arousal_weight: 1.0
   consistency_weight: 0.1
@@ -34,7 +34,36 @@ xtts:
 
 # Hardware settings
 device: "cuda"
-num_workers: 4
+num_workers: 0  # Set to 0 to avoid multiprocessing issues during debugging
 
 # Reproducibility
 seed: 42
+
+# VAD model configuration (NEW)
+vad_model_dir: "models/vad_model"  # Updated path
+
+# Quick test mode for rapid experimentation (NEW) - ENABLED BY DEFAULT
+quick_test:
+  enabled: true   # ENABLED for initial testing
+  max_samples: 500   # Start small for debugging
+  max_steps: 50      # Very limited for quick feedback
+  max_speakers: 10   # Focus on subset of speakers
+  emotions_to_test: ["HAP", "SAD", "ANG", "NEU"]  # Subset of emotions
+
+# VAD-based loss weights (NEW - replaces old loss system)
+loss_weights:
+  vad_weight: 0.7      # Primary focus on emotional accuracy  
+  speaker_weight: 0.3  # Secondary focus on speaker preservation
+
+# XTTS inference parameters (NEW)
+inference:
+  temperature: 0.75
+  length_penalty: 1.0
+  repetition_penalty: 1.1
+  top_k: 50
+  top_p: 0.8
+
+# Evaluation configuration (NEW)
+evaluation:
+  val_every_n_epochs: 1
+  generate_samples_every: 50  # Generate sample outputs every N steps for monitoring
