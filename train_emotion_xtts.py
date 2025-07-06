@@ -78,6 +78,44 @@ class EmotionalXTTSTrainer:
         # Training step counter for periodic VAD evaluation
         self.training_step_count = 0
         
+        # Initialize adaptive targets for VAD-guided training from config
+        vad_config = self.config.get('vad_training', {})
+        adaptation_config = vad_config.get('adaptation', {})
+        
+        self.adaptive_gpt_strength = adaptation_config.get('initial_gpt_strength', 0.2)
+        self.adaptive_speaker_strength = adaptation_config.get('initial_speaker_strength', 0.1)
+        self.vad_feedback_history = []
+        
+        # Store config parameters for easy access
+        self.vad_eval_frequency = vad_config.get('vad_eval_frequency', 10)
+        self.low_accuracy_threshold = adaptation_config.get('low_accuracy_threshold', 0.7)
+        self.high_accuracy_threshold = adaptation_config.get('high_accuracy_threshold', 0.9)
+        self.increase_rate_gpt = adaptation_config.get('increase_rate_gpt', 1.05)
+        self.increase_rate_speaker = adaptation_config.get('increase_rate_speaker', 1.03)
+        self.decrease_rate_gpt = adaptation_config.get('decrease_rate_gpt', 0.98)
+        self.decrease_rate_speaker = adaptation_config.get('decrease_rate_speaker', 0.99)
+        self.min_gpt_strength = adaptation_config.get('min_gpt_strength', 0.05)
+        self.max_gpt_strength = adaptation_config.get('max_gpt_strength', 0.8)
+        self.min_speaker_strength = adaptation_config.get('min_speaker_strength', 0.02)
+        self.max_speaker_strength = adaptation_config.get('max_speaker_strength', 0.4)
+        self.max_feedback_history = adaptation_config.get('max_feedback_history', 50)
+        self.recent_history_window = adaptation_config.get('recent_history_window', 10)
+        
+        # VAD evaluation mode settings
+        modes_config = vad_config.get('modes', {})
+        self.vad_training_enabled = modes_config.get('training', True)
+        self.vad_validation_enabled = modes_config.get('validation', True)
+        self.vad_disabled = modes_config.get('disable_vad_eval', False)
+        self.vad_validation_only = modes_config.get('validation_only', False)
+        
+        # Print VAD configuration
+        print(f"VAD Training Configuration:")
+        print(f"  Evaluation frequency: every {self.vad_eval_frequency} steps")
+        print(f"  Training VAD: {'enabled' if self.vad_training_enabled and not self.vad_disabled else 'disabled'}")
+        print(f"  Validation VAD: {'enabled' if self.vad_validation_enabled and not self.vad_disabled else 'disabled'}")
+        print(f"  Initial strengths: GPT={self.adaptive_gpt_strength:.3f}, Speaker={self.adaptive_speaker_strength:.3f}")
+        print(f"  Adaptation thresholds: low={self.low_accuracy_threshold:.2f}, high={self.high_accuracy_threshold:.2f}")
+        
         print("Trainer initialization complete!")
 
     def debug_tensor_devices(self, *tensors, names=None):
@@ -266,8 +304,53 @@ class EmotionalXTTSTrainer:
             t = torch.linspace(0, duration, int(sample_rate * duration), device=self.device)
             return 0.1 * torch.sin(2 * 3.14159 * 440 * t)
 
+    def get_vad_guided_targets(self, target_valence, target_arousal):
+        """Get conditioning targets based on VAD feedback history."""
+        
+        # Base target calculation
+        emotion_magnitude = torch.sqrt(target_valence**2 + target_arousal**2)
+        
+        # Adaptive targets based on VAD feedback
+        target_gpt_modification = torch.tensor(
+            self.adaptive_gpt_strength * (0.5 + emotion_magnitude.item()), 
+            requires_grad=False, 
+            device=target_valence.device
+        )
+        
+        target_speaker_modification = torch.tensor(
+            self.adaptive_speaker_strength * (0.5 + emotion_magnitude.item()), 
+            requires_grad=False, 
+            device=target_valence.device
+        )
+        
+        return target_gpt_modification, target_speaker_modification
+
+    def update_vad_guided_targets(self, vad_accuracy):
+        """Update adaptive targets based on VAD feedback."""
+        
+        # Track VAD accuracy history
+        self.vad_feedback_history.append(vad_accuracy)
+        if len(self.vad_feedback_history) > self.max_feedback_history:
+            self.vad_feedback_history.pop(0)
+        
+        # Adjust targets based on recent VAD performance
+        recent_accuracy = sum(self.vad_feedback_history[-self.recent_history_window:]) / min(self.recent_history_window, len(self.vad_feedback_history))
+        
+        if recent_accuracy < self.low_accuracy_threshold:  # VAD shows we're not hitting targets
+            self.adaptive_gpt_strength *= self.increase_rate_gpt
+            self.adaptive_speaker_strength *= self.increase_rate_speaker
+            print(f"Increasing conditioning strength: GPT={self.adaptive_gpt_strength:.3f} (accuracy: {recent_accuracy:.3f})")
+        elif recent_accuracy > self.high_accuracy_threshold:  # VAD shows we're very accurate
+            self.adaptive_gpt_strength *= self.decrease_rate_gpt
+            self.adaptive_speaker_strength *= self.decrease_rate_speaker
+            print(f"Decreasing conditioning strength: GPT={self.adaptive_gpt_strength:.3f} (accuracy: {recent_accuracy:.3f})")
+        
+        # Clamp to configured ranges
+        self.adaptive_gpt_strength = max(self.min_gpt_strength, min(self.max_gpt_strength, self.adaptive_gpt_strength))
+        self.adaptive_speaker_strength = max(self.min_speaker_strength, min(self.max_speaker_strength, self.adaptive_speaker_strength))
+
     def compute_conditioning_loss(self, speaker_ref_path, target_valence, target_arousal):
-        """Compute loss based on conditioning latents (differentiable training loss)."""
+        """Compute conditioning loss with VAD-guided targets (differentiable training loss)."""
         try:
             device = self.device  # Use consistent device reference
             
@@ -290,24 +373,20 @@ class EmotionalXTTSTrainer:
             emotion_gpt_latent = emotion_gpt_latent.to(device)
             emotion_speaker_emb = emotion_speaker_emb.to(device)
             
-            # Debug tensor devices if needed
-            # self.debug_tensor_devices(
-            #     original_gpt_latent, emotion_gpt_latent, original_speaker_emb, emotion_speaker_emb,
-            #     names=['orig_gpt', 'emo_gpt', 'orig_spk', 'emo_spk']
-            # )
-            
             # Now compute differences (all tensors guaranteed to be on same device)
             gpt_diff = torch.norm(emotion_gpt_latent - original_gpt_latent)
             speaker_diff = torch.norm(emotion_speaker_emb - original_speaker_emb)
             
-            # 2. Emotional strength should correlate with modification magnitude
-            emotion_strength = torch.sqrt(target_valence**2 + target_arousal**2)
-            target_modification = 0.1 + 0.3 * emotion_strength  # Target modification range [0.1, 0.4]
+            # VAD-GUIDED TARGET CALCULATION (replaces heuristic)
+            target_gpt_modification, target_speaker_modification = self.get_vad_guided_targets(
+                target_valence, target_arousal
+            )
             
-            gpt_loss = F.smooth_l1_loss(gpt_diff, target_modification)
-            speaker_loss = F.smooth_l1_loss(speaker_diff, target_modification * 0.5)  # Speaker should change less
+            # Compute losses with VAD-guided targets
+            gpt_loss = F.smooth_l1_loss(gpt_diff, target_gpt_modification)
+            speaker_loss = F.smooth_l1_loss(speaker_diff, target_speaker_modification)
             
-            # 3. Regularization to prevent extreme values
+            # Regularization to prevent extreme values
             reg_loss = 0.01 * (torch.norm(emotion_gpt_latent) + torch.norm(emotion_speaker_emb))
             
             total_loss = gpt_loss + speaker_loss + reg_loss
@@ -315,7 +394,8 @@ class EmotionalXTTSTrainer:
             return total_loss, {
                 'gpt_diff': gpt_diff.item(),
                 'speaker_diff': speaker_diff.item(),
-                'emotion_strength': emotion_strength.item(),
+                'target_gpt_mod': target_gpt_modification.item(),
+                'target_speaker_mod': target_speaker_modification.item(),
                 'gpt_loss': gpt_loss.item(),
                 'speaker_loss': speaker_loss.item(),
                 'reg_loss': reg_loss.item()
@@ -400,7 +480,7 @@ class EmotionalXTTSTrainer:
                 self.cleanup_temp_file(temp_path)
 
     def training_step(self, batch):
-        """Training step with conditioning loss (differentiable) + periodic VAD evaluation."""
+        """Training step with VAD-guided conditioning loss + periodic VAD evaluation."""
         try:
             self.optimizer.zero_grad()
             
@@ -411,12 +491,19 @@ class EmotionalXTTSTrainer:
             conditioning_metrics = {
                 'gpt_diff': 0.0,
                 'speaker_diff': 0.0,
-                'emotion_strength': 0.0
+                'target_gpt_mod': 0.0,
+                'target_speaker_mod': 0.0
             }
             
-            # VAD evaluation (only every N samples for monitoring)
-            do_vad_eval = (self.training_step_count % 10 == 0)  # Every 10th step
+            # VAD evaluation (configurable frequency and modes)
+            do_vad_eval = (
+                not self.vad_disabled and  # VAD not completely disabled
+                self.vad_training_enabled and  # Training VAD enabled
+                not self.vad_validation_only and  # Not validation-only mode
+                (self.training_step_count % self.vad_eval_frequency == 0)  # Configurable frequency
+            )
             vad_metrics = {'valence_mae': 0.0, 'arousal_mae': 0.0} if do_vad_eval else {}
+            vad_samples = 0
             
             # Process each sample in the batch
             for i in range(batch_size):
@@ -425,7 +512,7 @@ class EmotionalXTTSTrainer:
                     target_valence = batch['target_valences'][i].to(self.device)
                     target_arousal = batch['target_arousals'][i].to(self.device)
                     
-                    # Main training loss: differentiable conditioning loss
+                    # Main training loss: differentiable conditioning loss with VAD-guided targets
                     conditioning_loss, cond_info = self.compute_conditioning_loss(
                         batch['speaker_refs'][i],
                         target_valence,
@@ -460,6 +547,7 @@ class EmotionalXTTSTrainer:
                                 if status == "success" and vad_result:
                                     vad_metrics['valence_mae'] += abs(vad_result['valence'] - target_valence.item())
                                     vad_metrics['arousal_mae'] += abs(vad_result['arousal'] - target_arousal.item())
+                                    vad_samples += 1
                                     
                             except Exception as e:
                                 print(f"VAD evaluation failed for sample {i}: {e}")
@@ -484,9 +572,13 @@ class EmotionalXTTSTrainer:
                 for key in conditioning_metrics:
                     conditioning_metrics[key] /= valid_samples
                 
-                if do_vad_eval and vad_metrics:
+                if do_vad_eval and vad_samples > 0:
                     for key in vad_metrics:
-                        vad_metrics[key] /= valid_samples
+                        vad_metrics[key] /= vad_samples
+                    
+                    # Update VAD-guided targets based on accuracy
+                    vad_accuracy = max(0.0, 1.0 - (vad_metrics['valence_mae'] + vad_metrics['arousal_mae']) / 2.0)
+                    self.update_vad_guided_targets(vad_accuracy)
                 
                 # Track training step count
                 self.training_step_count = getattr(self, 'training_step_count', 0) + 1
@@ -496,11 +588,14 @@ class EmotionalXTTSTrainer:
                     'conditioning_loss': avg_loss.item(),
                     'gpt_diff': conditioning_metrics['gpt_diff'],
                     'speaker_diff': conditioning_metrics['speaker_diff'], 
-                    'emotion_strength': conditioning_metrics['emotion_strength'],
+                    'target_gpt_mod': conditioning_metrics['target_gpt_mod'],
+                    'target_speaker_mod': conditioning_metrics['target_speaker_mod'],
                     'valence_mae': vad_metrics.get('valence_mae', 0.0),
                     'arousal_mae': vad_metrics.get('arousal_mae', 0.0),
                     'valid_samples': valid_samples,
-                    'vad_evaluated': do_vad_eval
+                    'vad_evaluated': do_vad_eval and vad_samples > 0,
+                    'adaptive_gpt_strength': self.adaptive_gpt_strength,
+                    'adaptive_speaker_strength': self.adaptive_speaker_strength
                 }
             else:
                 print("Warning: No valid samples in batch - skipping")
@@ -509,11 +604,14 @@ class EmotionalXTTSTrainer:
                     'conditioning_loss': 0.0,
                     'gpt_diff': 0.0,
                     'speaker_diff': 0.0,
-                    'emotion_strength': 0.0,
+                    'target_gpt_mod': 0.0,
+                    'target_speaker_mod': 0.0,
                     'valence_mae': 0.0,
                     'arousal_mae': 0.0,
                     'valid_samples': 0,
-                    'vad_evaluated': False
+                    'vad_evaluated': False,
+                    'adaptive_gpt_strength': self.adaptive_gpt_strength,
+                    'adaptive_speaker_strength': self.adaptive_speaker_strength
                 }
                 
         except Exception as e:
@@ -523,11 +621,14 @@ class EmotionalXTTSTrainer:
                 'conditioning_loss': 0.0,
                 'gpt_diff': 0.0,
                 'speaker_diff': 0.0, 
-                'emotion_strength': 0.0,
+                'target_gpt_mod': 0.0,
+                'target_speaker_mod': 0.0,
                 'valence_mae': 0.0,
                 'arousal_mae': 0.0,
                 'valid_samples': 0,
-                'vad_evaluated': False
+                'vad_evaluated': False,
+                'adaptive_gpt_strength': self.adaptive_gpt_strength,
+                'adaptive_speaker_strength': self.adaptive_speaker_strength
             }
 
     def validation_step(self, batch):
@@ -543,6 +644,12 @@ class EmotionalXTTSTrainer:
                     'arousal_mae': 0.0
                 }
                 
+                # Check if VAD evaluation is enabled for validation
+                vad_eval_enabled = (
+                    not self.vad_disabled and 
+                    self.vad_validation_enabled
+                )
+                
                 for i in range(batch_size):
                     try:
                         # Ensure target values are on correct device
@@ -556,37 +663,54 @@ class EmotionalXTTSTrainer:
                             target_arousal
                         )
                         
-                        # Generate audio for VAD evaluation
-                        generated_audio = self.generate_audio_sample(
-                            text=batch['texts'][i],
-                            speaker_ref=batch['speaker_refs'][i],
-                            target_valence=target_valence,
-                            target_arousal=target_arousal
-                        )
-                        
-                        # VAD evaluation
-                        temp_path = self.save_temp_audio(generated_audio.detach().cpu())
-                        vad_result, status = self.vad_analyzer.extract(temp_path)
-                        self.cleanup_temp_file(temp_path)
-                        
-                        if torch.isfinite(conditioning_loss) and status == "success" and vad_result:
-                            total_conditioning_loss += conditioning_loss.item()
-                            valid_samples += 1
+                        # Generate audio for VAD evaluation (only if enabled)
+                        if vad_eval_enabled:
+                            generated_audio = self.generate_audio_sample(
+                                text=batch['texts'][i],
+                                speaker_ref=batch['speaker_refs'][i],
+                                target_valence=target_valence,
+                                target_arousal=target_arousal
+                            )
                             
-                            vad_metrics['valence_mae'] += abs(vad_result['valence'] - target_valence.item())
-                            vad_metrics['arousal_mae'] += abs(vad_result['arousal'] - target_arousal.item())
+                            # VAD evaluation
+                            temp_path = self.save_temp_audio(generated_audio.detach().cpu())
+                            vad_result, status = self.vad_analyzer.extract(temp_path)
+                            self.cleanup_temp_file(temp_path)
+                            
+                            if torch.isfinite(conditioning_loss) and status == "success" and vad_result:
+                                total_conditioning_loss += conditioning_loss.item()
+                                valid_samples += 1
+                                
+                                vad_metrics['valence_mae'] += abs(vad_result['valence'] - target_valence.item())
+                                vad_metrics['arousal_mae'] += abs(vad_result['arousal'] - target_arousal.item())
+                        else:
+                            # Only conditioning loss if VAD is disabled
+                            if torch.isfinite(conditioning_loss):
+                                total_conditioning_loss += conditioning_loss.item()
+                                valid_samples += 1
                         
                     except Exception as e:
                         print(f"Error in validation sample {i}: {e}")
                         continue
                 
                 if valid_samples > 0:
-                    return {
+                    result = {
                         'conditioning_loss': total_conditioning_loss / valid_samples,
-                        'valence_mae': vad_metrics['valence_mae'] / valid_samples,
-                        'arousal_mae': vad_metrics['arousal_mae'] / valid_samples,
                         'valid_samples': valid_samples
                     }
+                    
+                    if vad_eval_enabled:
+                        result.update({
+                            'valence_mae': vad_metrics['valence_mae'] / valid_samples,
+                            'arousal_mae': vad_metrics['arousal_mae'] / valid_samples,
+                        })
+                    else:
+                        result.update({
+                            'valence_mae': 0.0,
+                            'arousal_mae': 0.0,
+                        })
+                    
+                    return result
                 else:
                     return {
                         'conditioning_loss': 0.0,
@@ -612,10 +736,13 @@ class EmotionalXTTSTrainer:
             'conditioning_loss': 0.0,
             'gpt_diff': 0.0,
             'speaker_diff': 0.0,
-            'emotion_strength': 0.0,
+            'target_gpt_mod': 0.0,
+            'target_speaker_mod': 0.0,
             'valence_mae': 0.0,
             'arousal_mae': 0.0,
-            'valid_samples': 0
+            'valid_samples': 0,
+            'adaptive_gpt_strength': 0.0,
+            'adaptive_speaker_strength': 0.0
         }
         num_batches = 0
         
@@ -639,8 +766,8 @@ class EmotionalXTTSTrainer:
             # Update progress bar
             pbar.set_postfix({
                 'loss': f'{metrics["total_loss"]:.4f}',
-                'gpt_diff': f'{metrics["gpt_diff"]:.3f}',
-                'spk_diff': f'{metrics["speaker_diff"]:.3f}',
+                'gpt_str': f'{metrics["adaptive_gpt_strength"]:.3f}',
+                'spk_str': f'{metrics["adaptive_speaker_strength"]:.3f}',
                 'v_mae': f'{metrics["valence_mae"]:.3f}' if metrics['vad_evaluated'] else 'N/A',
                 'a_mae': f'{metrics["arousal_mae"]:.3f}' if metrics['vad_evaluated'] else 'N/A'
             })
@@ -651,6 +778,8 @@ class EmotionalXTTSTrainer:
             self.writer.add_scalar('Train/ConditioningLoss', metrics['conditioning_loss'], step)
             self.writer.add_scalar('Train/GPTDiff', metrics['gpt_diff'], step)
             self.writer.add_scalar('Train/SpeakerDiff', metrics['speaker_diff'], step)
+            self.writer.add_scalar('Train/AdaptiveGPTStrength', metrics['adaptive_gpt_strength'], step)
+            self.writer.add_scalar('Train/AdaptiveSpeakerStrength', metrics['adaptive_speaker_strength'], step)
             
             if metrics['vad_evaluated']:
                 self.writer.add_scalar('Train/ValenceMAE', metrics['valence_mae'], step)
@@ -661,8 +790,9 @@ class EmotionalXTTSTrainer:
                 print(f"Epoch {epoch}, Batch {batch_idx}")
                 print(f"  Total Loss: {metrics['total_loss']:.4f}")
                 print(f"  Conditioning Loss: {metrics['conditioning_loss']:.4f}")
-                print(f"  GPT Diff: {metrics['gpt_diff']:.3f}")
-                print(f"  Speaker Diff: {metrics['speaker_diff']:.3f}")
+                print(f"  GPT Diff: {metrics['gpt_diff']:.3f} (target: {metrics['target_gpt_mod']:.3f})")
+                print(f"  Speaker Diff: {metrics['speaker_diff']:.3f} (target: {metrics['target_speaker_mod']:.3f})")
+                print(f"  Adaptive Strengths: GPT={metrics['adaptive_gpt_strength']:.3f}, Speaker={metrics['adaptive_speaker_strength']:.3f}")
                 if metrics['vad_evaluated']:
                     print(f"  Valence MAE: {metrics['valence_mae']:.3f}")
                     print(f"  Arousal MAE: {metrics['arousal_mae']:.3f}")
@@ -715,7 +845,10 @@ class EmotionalXTTSTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
-            'config': self.config
+            'config': self.config,
+            'adaptive_gpt_strength': self.adaptive_gpt_strength,
+            'adaptive_speaker_strength': self.adaptive_speaker_strength,
+            'vad_feedback_history': self.vad_feedback_history
         }
         
         # Save regular checkpoint
@@ -738,12 +871,22 @@ class EmotionalXTTSTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
+        # Load adaptive parameters
+        if 'adaptive_gpt_strength' in checkpoint:
+            self.adaptive_gpt_strength = checkpoint['adaptive_gpt_strength']
+        if 'adaptive_speaker_strength' in checkpoint:
+            self.adaptive_speaker_strength = checkpoint['adaptive_speaker_strength']
+        if 'vad_feedback_history' in checkpoint:
+            self.vad_feedback_history = checkpoint['vad_feedback_history']
+        
         print(f"Checkpoint loaded from {checkpoint_path}")
+        print(f"Restored adaptive strengths: GPT={self.adaptive_gpt_strength:.3f}, Speaker={self.adaptive_speaker_strength:.3f}")
+        print(f"VAD feedback history: {len(self.vad_feedback_history)} samples")
         return checkpoint['epoch'], checkpoint.get('train_metrics', {}), checkpoint.get('val_metrics', {})
 
     def train(self):
         """Main training loop."""
-        print("Starting Emotional XTTS training with VAD evaluation...")
+        print("Starting VAD-Guided Emotional XTTS training...")
         
         # Set random seeds
         torch.manual_seed(42)
@@ -770,8 +913,9 @@ class EmotionalXTTSTrainer:
             print(f"Epoch {epoch + 1} Summary:")
             print(f"  Train - Total Loss: {train_metrics['total_loss']:.4f}")
             print(f"  Train - Conditioning Loss: {train_metrics['conditioning_loss']:.4f}")
-            print(f"  Train - GPT Diff: {train_metrics['gpt_diff']:.3f}")
-            print(f"  Train - Speaker Diff: {train_metrics['speaker_diff']:.3f}")
+            print(f"  Train - GPT Diff: {train_metrics['gpt_diff']:.3f} (target: {train_metrics['target_gpt_mod']:.3f})")
+            print(f"  Train - Speaker Diff: {train_metrics['speaker_diff']:.3f} (target: {train_metrics['target_speaker_mod']:.3f})")
+            print(f"  Train - Adaptive Strengths: GPT={train_metrics['adaptive_gpt_strength']:.3f}, Speaker={train_metrics['adaptive_speaker_strength']:.3f}")
             print(f"  Train - Valence MAE: {train_metrics['valence_mae']:.3f}")
             print(f"  Train - Arousal MAE: {train_metrics['arousal_mae']:.3f}")
             print(f"  Val - Conditioning Loss: {val_metrics['conditioning_loss']:.4f}")
@@ -794,10 +938,16 @@ class EmotionalXTTSTrainer:
         final_adapter_path = self.checkpoint_dir / "emotional_adapter_final.pth"
         torch.save({
             'va_adapter_state_dict': self.model.va_adapter.state_dict(),
-            'config': self.config
+            'config': self.config,
+            'adaptive_gpt_strength': self.adaptive_gpt_strength,
+            'adaptive_speaker_strength': self.adaptive_speaker_strength,
+            'vad_feedback_history': self.vad_feedback_history
         }, final_adapter_path)
         
         print(f"Final emotional adapter saved to: {final_adapter_path}")
+        print(f"Final adaptive strengths: GPT={self.adaptive_gpt_strength:.3f}, Speaker={self.adaptive_speaker_strength:.3f}")
+        print(f"VAD evaluation frequency used: every {self.vad_eval_frequency} steps")
+        print(f"Total VAD feedback samples collected: {len(self.vad_feedback_history)}")
         
         # Close tensorboard writer
         self.writer.close()
@@ -805,7 +955,7 @@ class EmotionalXTTSTrainer:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Train Emotional XTTS model with VAD evaluation")
+    parser = argparse.ArgumentParser(description="Train VAD-Guided Emotional XTTS model")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()

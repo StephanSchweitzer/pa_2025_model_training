@@ -34,13 +34,19 @@ class ValenceArousalDataset(Dataset):
                 skipped += 1
                 continue
                 
-            # Validate valence and arousal range [-1, 1]
+            # Validate valence and arousal range [0, 1] with clamping
             try:
                 valence = float(item['valence'])
                 arousal = float(item['arousal'])
-                if not (-1 <= valence <= 1) or not (-1 <= arousal <= 1):
-                    skipped += 1
-                    continue
+                
+                # Clamp values to [0, 1] range instead of rejecting
+                valence = max(0.0, min(1.0, valence))
+                arousal = max(0.0, min(1.0, arousal))
+                
+                # Update the clamped values back to the item
+                item['valence'] = valence
+                item['arousal'] = arousal
+                
             except (ValueError, TypeError):
                 skipped += 1
                 continue
@@ -250,7 +256,7 @@ class ValenceArousalDataset(Dataset):
         # Reference speaker file path (for XTTS conditioning)
         ref_speaker_path = str(ref_audio_path.resolve())
         
-        # Target emotion values (what we want to generate)
+        # Target emotion values (what we want to generate) - already clamped to [0,1]
         target_valence = float(target_sample['valence'])
         target_arousal = float(target_sample['arousal'])
         

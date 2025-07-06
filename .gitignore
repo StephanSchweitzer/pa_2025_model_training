@@ -13,3 +13,5 @@ test_dvae.py
 xtts_checkpoints/
 checkpoints/
 test_vad_temp.py
+backup_models/
+old_utils/

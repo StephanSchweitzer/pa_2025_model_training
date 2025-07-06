@@ -5,7 +5,7 @@ from emotion_model import ValenceArousalXTTS
 # === EASY TO CHANGE VARIABLES ===
 REFERENCE_AUDIO = "voices/stef/test1.wav"
 TEXT_TO_GENERATE = "I wonder what the day has in store for me, and I hope everything goes well!"
-ADAPTER_PATH = "checkpoints/valence_arousal_xtts/emotional_adapter_final.pth"
+ADAPTER_PATH = "checkpoints/valence_arousal_xtts/test_2_adaptive_with_VAD.pth"
 
 # Emotion settings (valence, arousal):
 # Valence: 0.0 = very negative, 1.0 = very positive
@@ -13,7 +13,7 @@ ADAPTER_PATH = "checkpoints/valence_arousal_xtts/emotional_adapter_final.pth"
 EMOTIONS = {
     "happy": (0.9, 0.9),    # High valence (positive), moderate-high arousal (energetic)
     "sad": (0.1, 0.1),      # Low valence (negative), low arousal (low energy)
-    "angry": (0.1, 0.9),    # Low valence (negative), high arousal (very energetic)
+    "angry": (0.9, 0.9),    # Low valence (negative), high arousal (very energetic)
 }
 
 # === LOAD MODEL ===
