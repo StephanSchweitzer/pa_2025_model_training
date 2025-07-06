@@ -4,21 +4,19 @@ data:
   sample_rate: 22050
   
 model:
-  unfreeze_last_n_layers: 0  # Start with frozen XTTS, only train adapter
+  unfreeze_last_n_layers: 0
   
 training:
-  num_epochs: 4               # Reduce epochs (vs 6) 
+  num_epochs: 4
   learning_rate: 5e-5
-  batch_size: 1  # XTTS works best with batch_size=1
+  batch_size: 1
   
-  # Original loss weights (keeping for compatibility)
   valence_weight: 1.0
   arousal_weight: 1.0
   consistency_weight: 0.1
   regularization_weight: 0.01
   
-  # Checkpointing
-  checkpoint_every: 1      # More frequent checkpointing for full run
+  checkpoint_every: 1
   
 optimization:
   weight_decay: 0.01
@@ -28,34 +26,27 @@ paths:
   checkpoint_dir: "checkpoints/valence_arousal_xtts"
   log_dir: "logs/valence_arousal_xtts"
 
-# XTTS model location
 xtts:
   local_model_dir: "./models/xtts_v2"
 
-# Hardware settings
 device: "cuda"
-num_workers: 0  # Set to 0 to avoid multiprocessing issues during debugging
+num_workers: 0
 
-# Reproducibility
 seed: 42
 
-# VAD model configuration
 vad_model_dir: "models/vad_model"
 
-# Quick test mode - ACTUALLY reasonable for overnight
 quick_test:
   enabled: true               
-  max_samples: 500          # Reduce significantly (vs 8000)
-  max_steps: 500             # Much fewer steps per epoch (vs 1500)
-  max_speakers: 50           # Reduce speakers
-  emotions_to_test: ["HAP", "SAD", "ANG", "NEU", "FEA"]  # Fewer emotions
+  max_samples: 500
+  max_steps: 500
+  max_speakers: 50
+  emotions_to_test: ["HAP", "SAD", "ANG", "NEU", "FEA"]
 
-# VAD-based loss weights
 loss_weights:
-  vad_weight: 0.7      # Primary focus on emotional accuracy  
-  speaker_weight: 0.3  # Secondary focus on speaker preservation
+  vad_weight: 0.7
+  speaker_weight: 0.3
 
-# XTTS inference parameters
 inference:
   temperature: 0.75
   length_penalty: 1.0
@@ -63,45 +54,35 @@ inference:
   top_k: 50
   top_p: 0.8
 
-# Evaluation configuration
 evaluation:
   val_every_n_epochs: 1
   generate_samples_every: 50
 
-# OPTIMIZED VAD-guided training configuration based on initial results
 vad_training:
-  # Frequent VAD evaluation for maximum emotional guidance (as requested)
-  vad_eval_frequency: 5       # Every 5 steps for tight emotional control
+  vad_eval_frequency: 5
   
-  # VAD feedback adaptation settings - CORRECTED logic based on user feedback
   adaptation:
-    # Clear thresholds based on user's 0.1-0.2 error tolerance
-    low_accuracy_threshold: 0.85  # 85% accuracy = 0.15 combined MAE (increase conditioning)
-    high_accuracy_threshold: 0.95 # 95% accuracy = 0.05 combined MAE (KEEP STABLE - don't change!)
+    low_accuracy_threshold: 0.85
+    high_accuracy_threshold: 0.95
     
-    # Adaptation rates
-    increase_rate_gpt: 1.1        # Increase when accuracy is poor
-    increase_rate_speaker: 1.05   # Increase when accuracy is poor
-    decrease_rate_gpt: 1.0        # NO CHANGE when accuracy is excellent (was 0.95)
-    decrease_rate_speaker: 1.0    # NO CHANGE when accuracy is excellent (was 0.98)
+    increase_rate_gpt: 1.1
+    increase_rate_speaker: 1.05
+    decrease_rate_gpt: 1.0
+    decrease_rate_speaker: 1.0
     
-    # Conditioning strength limits - INCREASED based on your results
-    min_gpt_strength: 0.1         # Increase minimum (was 0.05)
-    max_gpt_strength: 1.2         # Increase maximum (was 0.8) - your model needs 1.053!
-    min_speaker_strength: 0.05    # Increase minimum (was 0.02)
-    max_speaker_strength: 0.6     # Increase maximum (was 0.4)
+    min_gpt_strength: 0.1
+    max_gpt_strength: 1.2
+    min_speaker_strength: 0.05
+    max_speaker_strength: 0.6
     
-    # BETTER initial conditioning strengths based on your actual performance
-    initial_gpt_strength: 0.4     # Increase from 0.2 → closer to your 1.053 actual
-    initial_speaker_strength: 0.12 # Slight increase from 0.1 → closer to your 0.110 actual
+    initial_gpt_strength: 0.4
+    initial_speaker_strength: 0.12
     
-    # Feedback history settings
-    max_feedback_history: 100     # Increase for full run (was 50)
-    recent_history_window: 15     # Increase window (was 10)
+    max_feedback_history: 100
+    recent_history_window: 15
   
-  # VAD evaluation modes
   modes:
-    training: true                # Keep VAD evaluation during training
-    validation: true              # Keep VAD evaluation during validation
-    disable_vad_eval: false       # Keep VAD enabled
-    validation_only: false        # Keep training VAD enabled
+    training: true
+    validation: true
+    disable_vad_eval: false
+    validation_only: false

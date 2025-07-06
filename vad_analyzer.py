@@ -5,20 +5,12 @@ import torchaudio
 import numpy as np
 import os
 
-# Import our downloader module functions
-try:
-    from .vad_downloader import ensure_model, get_model_info, check_dependencies
-    DOWNLOADER_AVAILABLE = True
-except ImportError:
-    DOWNLOADER_AVAILABLE = False
-    print("vad_downloader module not found. Place vad_downloader.py in the same directory.")
 
 class VADAnalyzer:   
     def __init__(
         self, 
         model_dir: str = "models/vad_model",
         cache_dir: str = "models/vad_cache", 
-        auto_download: bool = True,
         verbose: bool = True
     ):
         self.target_sample_rate = 16000
@@ -29,44 +21,11 @@ class VADAnalyzer:
         self.model = None
         self.model_available = False
         
-        self._initialize_model(auto_download)
-        
-        
-        
-    def _initialize_model(self, auto_download: bool = True):
-        if not DOWNLOADER_AVAILABLE:
-            self._fallback_load()
-            return
-        
-        if not check_dependencies():
-            if self.verbose:
-                print("Required dependencies not available")
-            return
-        
-        try:
-            self.model = ensure_model(
-                model_dir=self.model_dir,
-                cache_dir=self.cache_dir,
-                auto_download=auto_download,
-                verbose=self.verbose
-            )
-            
-            if self.model is not None:
-                self.model_available = True
-                if self.verbose:
-                    print("VAD Analyzer ready for emotion analysis!")
-            else:
-                if self.verbose:
-                    print("Failed to load or download VAD model")
-                    
-        except Exception as e:
-            if self.verbose:
-                print(f"Error initializing model: {e}")
-            self.model_available = False
+        self._initialize_model()
     
     
     
-    def _fallback_load(self):
+    def _initialize_model(self):
         try:
             import audonnx
             
@@ -132,23 +91,17 @@ class VADAnalyzer:
         }
 
     def get_analyzer_info(self) -> Dict:
-        """Get comprehensive information about the analyzer and model."""
         base_info = {
             "analyzer_status": "available" if self.model_available else "unavailable",
             "model_directory": self.model_dir,
             "cache_directory": self.cache_dir,
             "target_sample_rate": self.target_sample_rate,
-            "downloader_module": "available" if DOWNLOADER_AVAILABLE else "unavailable"
         }
         
         if not self.model_available:
             return base_info
         
-        try:
-            if DOWNLOADER_AVAILABLE:
-                model_info = get_model_info(self.model_dir)
-                base_info.update(model_info)
-            
+        try:            
             test_signal = np.random.normal(size=self.target_sample_rate).astype(np.float32)
             test_output = self.model(test_signal, self.target_sample_rate)
             
@@ -168,10 +121,9 @@ class VADAnalyzer:
     
 
     def reload_model(self, auto_download: bool = True):
-        """Reload the model (useful if model files were updated)."""
         if self.verbose:
             print("Reloading VAD model...")
-        self._initialize_model(auto_download)
+        self._initialize_model()
         
         
 
@@ -181,7 +133,6 @@ if __name__ == "__main__":
     
     analyzer = VADAnalyzer(
         model_dir="models/vad_model",
-        auto_download=True,
         verbose=True
     )
     
